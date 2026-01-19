@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+SQLAlchemy
+psycopg2-binary
+requests
+python-dotenv
+pandas
+reportlab
+openpyxl
+apscheduler
