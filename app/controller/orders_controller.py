@@ -1,6 +1,6 @@
 
 from fastapi import APIRouter, Request, status, HTTPException, Query
-from pydantic import BaseModel, Field, conlist, PositiveInt, NonNegativeFloat
+from pydantic import BaseModel, Field, PositiveInt, NonNegativeFloat
 from typing import List, Optional, Literal, Any, Dict
 from sqlalchemy.orm import Session
 import logging
@@ -10,6 +10,9 @@ from app.models import SessionLocal, Order, OrderItem, Product, StockItem, Stock
 router = APIRouter()
 logger = logging.getLogger("uvicorn.error")
 
+# =========================
+# Pydantic Schemas
+# =========================
 class OrderItemIn(BaseModel):
     sku: str = Field(..., min_length=1, max_length=64)
     name: str = Field(..., min_length=1, max_length=160)
@@ -18,7 +21,7 @@ class OrderItemIn(BaseModel):
 
 class OrderIn(BaseModel):
     customer_name: str = Field(..., min_length=1, max_length=120)
-    items: conlist(OrderItemIn, min_items=1)
+    items: List[OrderItemIn] = Field(..., min_length=1)   # <- corrigido para Pydantic v2
     note: Optional[str] = Field(None, max_length=500)
     external_code: Optional[str] = Field(None, max_length=64)
 
@@ -29,7 +32,8 @@ class OrderItemOut(BaseModel):
     qty: int
     unit_price: float
     total: float
-    class Config: from_attributes = True
+    class Config:
+        from_attributes = True
 
 class OrderOut(BaseModel):
     id: int
@@ -39,7 +43,8 @@ class OrderOut(BaseModel):
     note: Optional[str]
     total_amount: float
     items: List[OrderItemOut]
-    class Config: from_attributes = True
+    class Config:
+        from_attributes = True
 
 class StatusPatchIn(BaseModel):
     status: Literal["CREATED","CONFIRMED","IN_PREPARATION","READY","FULFILLED","CANCELLED"]
@@ -47,6 +52,9 @@ class StatusPatchIn(BaseModel):
 def _db_session() -> Session:
     return SessionLocal()
 
+# =========================
+# Endpoints
+# =========================
 @router.post("/orders/manual", response_model=OrderOut, status_code=status.HTTP_201_CREATED, tags=["Orders"])
 def create_order_manual(payload: OrderIn):
     db = _db_session()
@@ -59,20 +67,24 @@ def create_order_manual(payload: OrderIn):
             total_amount=total,
             status="CREATED",
         )
-        db.add(order); db.flush()
+        db.add(order); db.flush()  # gera id
+
         for it in payload.items:
             db.add(OrderItem(
                 order_id=order.id,
-                sku=it.sku, name=it.name,
+                sku=it.sku,
+                name=it.name,
                 qty=it.qty,
                 unit_price=float(it.unit_price),
                 total=it.qty * float(it.unit_price),
             ))
+
         db.commit(); db.refresh(order)
         return order
-    except Exception:
-        db.rollback(); logger.exception("Erro ao criar pedido manual")
-        raise HTTPException(500, "Erro ao salvar pedido")
+    except Exception as e:
+        db.rollback()
+        logger.exception("Erro ao criar pedido manual: %s", e)
+        raise HTTPException(status_code=500, detail="Erro ao salvar pedido")
     finally:
         db.close()
 
@@ -81,17 +93,23 @@ def get_order(order_id: int):
     db = _db_session()
     try:
         order = db.query(Order).filter(Order.id == order_id).first()
-        if not order: raise HTTPException(404, "Pedido não encontrado")
+        if not order:
+            raise HTTPException(status_code=404, detail="Pedido não encontrado")
         return order
     finally:
         db.close()
 
 @router.get("/orders", response_model=List[OrderOut], tags=["Orders"])
-def list_orders(status_eq: Optional[str] = Query(None), limit: int = Query(50, ge=1, le=200), offset: int = Query(0, ge=0)):
+def list_orders(
+    status_eq: Optional[str] = Query(None),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0)
+):
     db = _db_session()
     try:
         q = db.query(Order)
-        if status_eq: q = q.filter(Order.status == status_eq)
+        if status_eq:
+            q = q.filter(Order.status == status_eq)
         return q.order_by(Order.id.desc()).offset(offset).limit(limit).all()
     finally:
         db.close()
@@ -101,36 +119,36 @@ def update_order_status(order_id: int, patch: StatusPatchIn):
     db: Session = SessionLocal()
     try:
         order = db.query(Order).filter(Order.id == order_id).first()
-        if not order: raise HTTPException(404, "Pedido não encontrado")
+        if not order:
+            raise HTTPException(status_code=404, detail="Pedido não encontrado")
+
         previous = order.status
         order.status = patch.status
         db.commit(); db.refresh(order)
+
+        # baixa de estoque ao confirmar (apenas 1x)
         if previous != "CONFIRMED" and patch.status == "CONFIRMED":
             for oi in order.items:
                 p = db.query(Product).filter(Product.sku == oi.sku).first()
-                if not p: continue
+                if not p:
+                    continue
                 si = db.query(StockItem).filter(StockItem.product_id == p.id).first()
-                if not si: continue
+                if not si:
+                    continue
                 qty = float(oi.qty)
                 si.quantity -= qty
                 db.add(StockMovement(
-                    product_id=p.id, movement_type=MovementType.OUT,
-                    quantity=qty, unit_price=None,
-                    reason="Order confirmed", reference=f"ORDER {order.id}"
+                    product_id=p.id,
+                    movement_type=MovementType.OUT,
+                    quantity=qty,
+                    unit_price=None,
+                    reason="Order confirmed",
+                    reference=f"ORDER {order.id}"
                 ))
             db.commit()
+
         return order
     finally:
         db.close()
 
 @router.post("/orders/webhook", status_code=status.HTTP_200_OK, tags=["Orders"])
-async def orders_webhook(request: Request) -> Dict[str, Any]:
-    try:
-        payload = await request.json(); content_type = "application/json"
-    except Exception:
-        raw_body = await request.body()
-        payload = {"_raw": raw_body.decode("utf-8", errors="ignore")}
-        content_type = request.headers.get("content-type", "unknown")
-    ip = request.client.host if request.client else "unknown"
-    logger.info("[WEBHOOK] /orders/webhook ip=%s content_type=%s payload=%s", ip, content_type, payload)
-    return {"received": True, "content_type": content_type, "message": "Webhook recebido com sucesso"}
