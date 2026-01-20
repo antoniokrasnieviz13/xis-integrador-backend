@@ -1,11 +1,9 @@
 
-# main.py
 from fastapi import FastAPI
 from app.controller.orders_controller import router as orders_router
 
 app = FastAPI()
 
-# opcional: health para teste rápido
 @app.get("/health")
 async def health():
     return {"status": "ok"}
