@@ -52,4 +52,3 @@ app.include_router(orders_router)
 #   uvicorn main:app --host 0.0.0.0 --port $PORT
 # Não é necessário bloco "if __name__ == '__main__':" neste arquivo.
 # -----------------------------------------------------------------------------
-``
